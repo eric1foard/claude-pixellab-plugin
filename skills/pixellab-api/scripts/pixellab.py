@@ -57,9 +57,30 @@ def decode_image(b64_data, output_path):
         f.write(data)
 
 
+def get_png_dimensions(path):
+    """Read width and height from a PNG file header."""
+    with open(path, "rb") as f:
+        header = f.read(24)
+        if header[:8] == b'\x89PNG\r\n\x1a\n' and header[12:16] == b'IHDR':
+            w = struct.unpack(">I", header[16:20])[0]
+            h = struct.unpack(">I", header[20:24])[0]
+            return w, h
+    return None, None
+
+
 def make_base64_image(path):
     """Create a Base64Image object from a file path."""
     return {"type": "base64", "base64": encode_image(path)}
+
+
+def make_style_image(path):
+    """Create a style image object with image data and dimensions."""
+    w, h = get_png_dimensions(path)
+    obj = {"image": make_base64_image(path)}
+    if w and h:
+        obj["width"] = w
+        obj["height"] = h
+    return obj
 
 
 def api_request(method, endpoint, body=None, api_key=None):
@@ -346,7 +367,7 @@ def cmd_generate_with_style(args):
 
     body = {
         "description": args.description,
-        "style_images": [make_base64_image(p) for p in args.style_images],
+        "style_images": [make_style_image(p) for p in args.style_images],
         "image_size": {"width": args.width, "height": args.height},
     }
 
