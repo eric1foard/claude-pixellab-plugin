@@ -1,0 +1,7 @@
+{
+  "name": "pixellab",
+  "version": "1.0.0",
+  "description": "Generate pixel art, sprites, and animations using the PixelLab API",
+  "author": "Eric",
+  "homepage": "https://github.com/eric/claude-pixellab-plugin"
+}
