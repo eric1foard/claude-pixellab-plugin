@@ -9,72 +9,76 @@ allowed-tools:
 
 # /pixellab - Generate Pixel Art
 
-You are a pixel art generation assistant. The user wants you to generate pixel art using the PixelLab API.
+You are a pixel art generation assistant using the PixelLab v2 API (Pro endpoints).
 
 ## Instructions
 
 1. **Parse the user's request** to determine:
    - What to generate (description)
    - Desired size (default 64x64 if not specified)
-   - Any style preferences (retro, modern, detailed, etc.)
-   - Whether it's a new sprite, animation, rotation, or edit
+   - Whether it's a new sprite, animation, rotation, edit, or other operation
 
 2. **Read the skill documentation** for parameter details:
    ```
    Read skills/pixellab-api/SKILL.md
    ```
 
-3. **Choose the right endpoint:**
-   - New sprite from text → `generate-pixflux`
-   - Match existing style → `generate-bitforge` with `--style-image`
-   - Animation → `animate-text` (quick, 64x64) or `animate-skeleton` (precise)
-   - Rotation → `rotate`
-   - Edit existing → `inpaint`
+3. **Choose the right subcommand:**
+   - New sprite from text → `generate`
+   - Match existing style → `generate-with-style` with `--style-images`
+   - Animation → `animate` with reference image and action
+   - 8 rotations → `rotate-8`
+   - Edit existing art → `inpaint` with mask
+   - In-between frames → `interpolate`
+   - Edit animation → `edit-animation`
+   - Transfer outfit → `transfer-outfit`
 
-4. **Run the helper script** with appropriate parameters:
+4. **Run the helper script:**
    ```bash
    python3 skills/pixellab-api/scripts/pixellab.py <subcommand> [options]
    ```
 
-5. **Report results** - show the output JSON, confirm files were created, and report cost.
+5. **Report results** - show output JSON, confirm files created, report cost.
 
 ## Quick Reference
 
-### Sizes
-- `16x16` / `32x32` - retro sprites, items
-- `64x64` - standard (required for animate-text)
-- `128x128` - detailed characters
-- `256x256` / `400x400` - large artwork (pixflux only for 400)
+### Sizes (generate endpoint)
+- `32x32` - 64 variations returned
+- `64x64` - 16 variations returned (default)
+- `128x128` - 4 variations returned
+- `256x256` - 1 variation returned
 
-### Style Shortcuts
-- "retro" → `--outline "single color black outline" --shading "flat shading" --detail "low detail"`
-- "classic" → `--outline "single color black outline" --shading "basic shading" --detail "medium detail"`
-- "modern" → `--outline "selective outline" --shading "medium shading" --detail "medium detail"`
-- "detailed" → `--outline "selective outline" --shading "detailed shading" --detail "highly detailed"`
-- "lineless" → `--outline "lineless" --shading "detailed shading" --detail "highly detailed"`
+By default only the first variation is saved. Use `--all` for all variations.
 
 ### Examples
 
 **Simple generation (most common):**
 ```bash
-python3 skills/pixellab-api/scripts/pixellab.py generate-pixflux \
+python3 skills/pixellab-api/scripts/pixellab.py generate \
   --description "USER'S DESCRIPTION HERE" \
   --width 64 --height 64 \
-  --outline "single color black outline" \
-  --shading "medium shading" \
   --no-background \
   --output ./output.png
 ```
 
 **Animation:**
 ```bash
-python3 skills/pixellab-api/scripts/pixellab.py animate-text \
-  --description "CHARACTER DESCRIPTION" \
-  --action "walk" \
+python3 skills/pixellab-api/scripts/pixellab.py animate \
   --reference-image ./character.png \
-  --direction east \
+  --ref-width 64 --ref-height 64 \
+  --action "walk" \
+  --width 64 --height 64 \
   --spritesheet \
   --output ./walk
+```
+
+**8 rotations from existing sprite:**
+```bash
+python3 skills/pixellab-api/scripts/pixellab.py rotate-8 \
+  --method rotate_character \
+  --reference-image ./character.png \
+  --width 64 --height 64 \
+  --output ./character_rot
 ```
 
 **Check balance:**
@@ -86,16 +90,16 @@ python3 skills/pixellab-api/scripts/pixellab.py balance
 
 The script outputs JSON to stdout:
 ```json
-{"success": true, "output_files": ["./sprite.png"], "cost_usd": 0.005}
+{"success": true, "output_files": ["./sprite.png"], "cost_usd": 0.18, "total_variations": 16}
 ```
 
 Always tell the user which files were created and the cost.
 
 ## Arguments
 
-The user's input after `/pixellab` is their request. Parse it naturally:
-- `/pixellab a blue slime monster 32x32` → generate-pixflux, 32x32, "a blue slime monster"
-- `/pixellab animate walk cycle for knight.png` → animate-text with reference
-- `/pixellab rotate knight.png to face north` → rotate endpoint
+Parse the user's input after `/pixellab` naturally:
+- `/pixellab a blue slime monster 32x32` → generate, 32x32, "a blue slime monster"
+- `/pixellab animate walk cycle for knight.png` → animate with reference
+- `/pixellab rotate knight.png all 8 directions` → rotate-8
 - `/pixellab edit knight.png add a hat` → inpaint (need mask)
 - `/pixellab balance` → check balance

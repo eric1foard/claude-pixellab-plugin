@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PixelLab API helper script for Claude Code.
+"""PixelLab API v2 helper script for Claude Code.
 
 Unified CLI for all PixelLab pixel art generation endpoints.
 Uses only Python stdlib (no pip dependencies).
@@ -8,14 +8,17 @@ Usage:
     python3 pixellab.py <subcommand> [options]
 
 Subcommands:
-    generate-pixflux    Text-to-pixel-art generation (up to 400x400)
-    generate-bitforge   Style transfer pixel art generation (up to 200x200)
-    animate-skeleton    Skeleton-based 4-frame animation (up to 256x256)
-    animate-text        Text-guided animation (64x64 only)
-    rotate              Rotate character view/direction (up to 200x200)
-    inpaint             Edit masked region of existing art (up to 200x200)
-    estimate-skeleton   Extract skeleton keypoints from character image
-    balance             Check account credit balance
+    generate            Generate pixel art from text (Pro, returns variations)
+    generate-with-style Style-guided generation (Pro, requires style images)
+    animate             Text-guided animation (Pro, multi-size)
+    rotate-8            Generate all 8 directional rotations (Pro)
+    inpaint             Edit masked region of existing art (Pro)
+    edit                Edit images with text or reference (Pro)
+    interpolate         Generate frames between two keyframes (Pro)
+    edit-animation      Edit existing animation frames (Pro)
+    transfer-outfit     Transfer outfit across animation frames (Pro)
+    estimate-skeleton   Extract skeleton keypoints from character
+    balance             Check account balance and subscription
 
 Environment:
     PIXELLAB_API_KEY    Required. Your PixelLab API token.
@@ -31,7 +34,7 @@ import urllib.error
 import urllib.request
 import zlib
 
-API_BASE = "https://api.pixellab.ai/v1"
+API_BASE = "https://api.pixellab.ai/v2"
 
 
 def get_api_key():
@@ -75,7 +78,7 @@ def api_request(method, endpoint, body=None, api_key=None):
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=600) as resp:
             return json.loads(resp.read().decode("utf-8")), None
     except urllib.error.HTTPError as e:
         try:
@@ -90,13 +93,16 @@ def api_request(method, endpoint, body=None, api_key=None):
         return None, str(e)
 
 
-def output_success(output_files, cost_usd):
+def output_success(output_files, cost_usd, extra=None):
     """Print success JSON to stdout."""
-    print(json.dumps({
+    result = {
         "success": True,
         "output_files": output_files,
         "cost_usd": cost_usd,
-    }))
+    }
+    if extra:
+        result.update(extra)
+    print(json.dumps(result))
 
 
 def output_error(message):
@@ -108,12 +114,35 @@ def output_error(message):
     sys.exit(1)
 
 
-def make_spritesheet(frame_paths, output_path):
-    """Combine frame PNGs into a horizontal spritesheet.
+def save_image_array(images, base_path, pick=None):
+    """Save an array of base64 images. Returns list of saved file paths.
 
-    Reads raw PNG data, decodes pixel data, combines horizontally,
-    and writes a new PNG. Uses only stdlib (struct, zlib).
+    If pick is set, saves only that index. Otherwise saves all.
     """
+    if base_path.endswith(".png"):
+        base_path = base_path[:-4]
+
+    output_files = []
+    if pick is not None:
+        if pick < 0 or pick >= len(images):
+            output_error(f"--pick {pick} out of range (0-{len(images)-1})")
+        path = f"{base_path}.png"
+        decode_image(images[pick]["base64"], path)
+        output_files.append(path)
+    elif len(images) == 1:
+        path = f"{base_path}.png"
+        decode_image(images[0]["base64"], path)
+        output_files.append(path)
+    else:
+        for i, img in enumerate(images):
+            path = f"{base_path}_{i}.png"
+            decode_image(img["base64"], path)
+            output_files.append(path)
+    return output_files
+
+
+def make_spritesheet(frame_paths, output_path):
+    """Combine frame PNGs into a horizontal spritesheet."""
     frames = []
     for path in frame_paths:
         with open(path, "rb") as f:
@@ -127,7 +156,6 @@ def make_spritesheet(frame_paths, output_path):
     frame_w, frame_h = frames[0][0], frames[0][1]
     total_w = frame_w * len(frames)
 
-    # Build combined pixel rows
     rows = []
     for y in range(frame_h):
         row = b"\x00"  # filter byte: None
@@ -154,7 +182,7 @@ def decode_png_pixels(data):
         chunk_len = struct.unpack(">I", data[pos:pos + 4])[0]
         chunk_type = data[pos + 4:pos + 8]
         chunk_data = data[pos + 8:pos + 8 + chunk_len]
-        pos += 12 + chunk_len  # 4 len + 4 type + data + 4 crc
+        pos += 12 + chunk_len
 
         if chunk_type == b"IHDR":
             width = struct.unpack(">I", chunk_data[0:4])[0]
@@ -173,7 +201,6 @@ def decode_png_pixels(data):
     channels = 4 if color_type == 6 else 3
     stride = width * channels
 
-    # Reconstruct pixels with PNG filtering
     pixels = bytearray()
     prev_row = bytearray(stride)
 
@@ -242,53 +269,20 @@ def write_png(path, width, height, raw_data):
         f.write(make_chunk(b"IEND", b""))
 
 
-def add_common_style_args(parser):
-    """Add common style arguments shared across generation endpoints."""
-    parser.add_argument("--outline", choices=[
-        "single color black outline", "single color outline",
-        "selective outline", "lineless",
-    ], default=None, help="Outline style")
-    parser.add_argument("--shading", choices=[
-        "flat shading", "basic shading", "medium shading",
-        "detailed shading", "highly detailed shading",
-    ], default=None, help="Shading style")
-    parser.add_argument("--detail", choices=[
-        "low detail", "medium detail", "highly detailed",
-    ], default=None, help="Detail level")
-    parser.add_argument("--view", choices=[
-        "side", "low top-down", "high top-down",
-    ], default=None, help="Camera view angle")
-    parser.add_argument("--direction", choices=[
-        "north", "north-east", "east", "south-east",
-        "south", "south-west", "west", "north-west",
-    ], default=None, help="Subject facing direction")
-
-
 def add_size_args(parser, default_w=64, default_h=64):
-    """Add width/height arguments."""
     parser.add_argument("--width", type=int, default=default_w, help="Image width in pixels")
     parser.add_argument("--height", type=int, default=default_h, help="Image height in pixels")
 
 
-def add_init_image_args(parser):
-    """Add init image arguments."""
-    parser.add_argument("--init-image", default=None, help="Path to initial image")
-    parser.add_argument("--init-image-strength", type=int, default=300,
-                        help="Strength of init image (1-999, default 300)")
-
-
 def add_seed_arg(parser):
-    """Add seed argument."""
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
 
 
-def build_body_with_optionals(body, args, keys):
-    """Add optional fields to request body if they are set."""
-    for key in keys:
-        attr = key.replace("-", "_")
-        val = getattr(args, attr, None)
-        if val is not None:
-            body[key.replace("-", "_")] = val
+def add_pick_arg(parser):
+    parser.add_argument("--pick", type=int, default=0,
+                        help="Save only the Nth variation (0-indexed). Default: 0 (first). Use -1 for all.")
+    parser.add_argument("--all", action="store_true",
+                        help="Save all variations instead of just the first")
 
 
 # --- Subcommand handlers ---
@@ -302,15 +296,19 @@ def cmd_balance(args):
     if err:
         output_error(err)
 
+    credits_info = resp.get("credits", {})
+    sub_info = resp.get("subscription", {})
     print(json.dumps({
         "success": True,
-        "balance_usd": resp.get("usd", 0),
+        "balance_usd": credits_info.get("usd", 0),
+        "subscription_generations": sub_info.get("generations", 0),
+        "subscription_total": sub_info.get("total", 0),
         "output_files": [],
         "cost_usd": 0,
     }))
 
 
-def cmd_generate_pixflux(args):
+def cmd_generate(args):
     api_key, err = get_api_key()
     if err:
         output_error(err)
@@ -322,237 +320,131 @@ def cmd_generate_pixflux(args):
 
     if args.no_background:
         body["no_background"] = True
-    if args.isometric:
-        body["isometric"] = True
-    if args.text_guidance_scale is not None:
-        body["text_guidance_scale"] = args.text_guidance_scale
-    if args.init_image:
-        body["init_image"] = make_base64_image(args.init_image)
-        body["init_image_strength"] = args.init_image_strength
-    if args.color_image:
-        body["color_image"] = make_base64_image(args.color_image)
-
-    build_body_with_optionals(body, args, [
-        "outline", "shading", "detail", "view", "direction", "seed",
-    ])
-
-    resp, err = api_request("POST", "/generate-image-pixflux", body, api_key)
-    if err:
-        output_error(err)
-
-    output_path = args.output or "output.png"
-    decode_image(resp["image"]["base64"], output_path)
-    cost = resp.get("usage", {}).get("usd", 0)
-    output_success([output_path], cost)
-
-
-def cmd_generate_bitforge(args):
-    api_key, err = get_api_key()
-    if err:
-        output_error(err)
-
-    body = {
-        "description": args.description,
-        "image_size": {"width": args.width, "height": args.height},
-    }
-
-    if args.no_background:
-        body["no_background"] = True
-    if args.isometric:
-        body["isometric"] = True
-    if args.oblique_projection:
-        body["oblique_projection"] = True
-    if args.text_guidance_scale is not None:
-        body["text_guidance_scale"] = args.text_guidance_scale
-    if args.style_strength is not None:
-        body["style_strength"] = args.style_strength
-    if args.coverage_percentage is not None:
-        body["coverage_percentage"] = args.coverage_percentage
-    if args.init_image:
-        body["init_image"] = make_base64_image(args.init_image)
-        body["init_image_strength"] = args.init_image_strength
+    if args.seed is not None:
+        body["seed"] = args.seed
+    if args.reference_images:
+        body["reference_images"] = [make_base64_image(p) for p in args.reference_images]
     if args.style_image:
         body["style_image"] = make_base64_image(args.style_image)
-    if args.inpainting_image:
-        body["inpainting_image"] = make_base64_image(args.inpainting_image)
-    if args.mask_image:
-        body["mask_image"] = make_base64_image(args.mask_image)
-    if args.color_image:
-        body["color_image"] = make_base64_image(args.color_image)
-    if args.skeleton_keypoints:
-        with open(args.skeleton_keypoints) as f:
-            body["skeleton_keypoints"] = json.load(f)
 
-    build_body_with_optionals(body, args, [
-        "outline", "shading", "detail", "view", "direction", "seed",
-    ])
-
-    resp, err = api_request("POST", "/generate-image-bitforge", body, api_key)
+    resp, err = api_request("POST", "/generate-image-v2", body, api_key)
     if err:
         output_error(err)
 
-    output_path = args.output or "output.png"
-    decode_image(resp["image"]["base64"], output_path)
+    images = resp.get("images", [])
+    base = args.output or "output"
+    pick = None if args.all else args.pick
+    output_files = save_image_array(images, base, pick)
     cost = resp.get("usage", {}).get("usd", 0)
-    output_success([output_path], cost)
+    output_success(output_files, cost, {"total_variations": len(images)})
 
 
-def cmd_animate_skeleton(args):
-    api_key, err = get_api_key()
-    if err:
-        output_error(err)
-
-    with open(args.skeleton_keypoints) as f:
-        keypoints = json.load(f)
-
-    body = {
-        "image_size": {"width": args.width, "height": args.height},
-        "reference_image": make_base64_image(args.reference_image),
-        "skeleton_keypoints": keypoints,
-    }
-
-    if args.view:
-        body["view"] = args.view
-    if args.direction:
-        body["direction"] = args.direction
-    if args.isometric:
-        body["isometric"] = True
-    if args.oblique_projection:
-        body["oblique_projection"] = True
-    if args.guidance_scale is not None:
-        body["guidance_scale"] = args.guidance_scale
-    if args.init_images:
-        body["init_images"] = [make_base64_image(p) for p in args.init_images]
-        body["init_image_strength"] = args.init_image_strength
-    if args.color_image:
-        body["color_image"] = make_base64_image(args.color_image)
-    if args.seed is not None:
-        body["seed"] = args.seed
-
-    resp, err = api_request("POST", "/animate-with-skeleton", body, api_key)
-    if err:
-        output_error(err)
-
-    base = args.output or "frame"
-    if base.endswith(".png"):
-        base = base[:-4]
-
-    output_files = []
-    for i, img in enumerate(resp["images"]):
-        path = f"{base}_{i}.png"
-        decode_image(img["base64"], path)
-        output_files.append(path)
-
-    if args.spritesheet:
-        sheet_path = f"{base}_spritesheet.png"
-        make_spritesheet(output_files, sheet_path)
-        output_files.append(sheet_path)
-
-    cost = resp.get("usage", {}).get("usd", 0)
-    output_success(output_files, cost)
-
-
-def cmd_animate_text(args):
+def cmd_generate_with_style(args):
     api_key, err = get_api_key()
     if err:
         output_error(err)
 
     body = {
-        "image_size": {"width": 64, "height": 64},
         "description": args.description,
-        "action": args.action,
-        "reference_image": make_base64_image(args.reference_image),
+        "style_images": [make_base64_image(p) for p in args.style_images],
+        "image_size": {"width": args.width, "height": args.height},
     }
 
-    if args.view:
-        body["view"] = args.view
-    if args.direction:
-        body["direction"] = args.direction
-    if args.n_frames is not None:
-        body["n_frames"] = args.n_frames
-    if args.start_frame_index is not None:
-        body["start_frame_index"] = args.start_frame_index
-    if args.text_guidance_scale is not None:
-        body["text_guidance_scale"] = args.text_guidance_scale
-    if args.image_guidance_scale is not None:
-        body["image_guidance_scale"] = args.image_guidance_scale
-    if args.init_images:
-        body["init_images"] = [make_base64_image(p) for p in args.init_images]
-        body["init_image_strength"] = args.init_image_strength
-    if args.color_image:
-        body["color_image"] = make_base64_image(args.color_image)
+    if args.style_description:
+        body["style_description"] = args.style_description
+    if args.no_background:
+        body["no_background"] = True
     if args.seed is not None:
         body["seed"] = args.seed
 
-    resp, err = api_request("POST", "/animate-with-text", body, api_key)
+    resp, err = api_request("POST", "/generate-with-style-v2", body, api_key)
     if err:
         output_error(err)
 
-    base = args.output or "frame"
-    if base.endswith(".png"):
-        base = base[:-4]
-
-    output_files = []
-    for i, img in enumerate(resp["images"]):
-        path = f"{base}_{i}.png"
-        decode_image(img["base64"], path)
-        output_files.append(path)
-
-    if args.spritesheet:
-        sheet_path = f"{base}_spritesheet.png"
-        make_spritesheet(output_files, sheet_path)
-        output_files.append(sheet_path)
-
+    images = resp.get("images", [])
+    base = args.output or "output"
+    pick = None if args.all else args.pick
+    output_files = save_image_array(images, base, pick)
     cost = resp.get("usage", {}).get("usd", 0)
-    output_success(output_files, cost)
+    output_success(output_files, cost, {"total_variations": len(images)})
 
 
-def cmd_rotate(args):
+def cmd_animate(args):
     api_key, err = get_api_key()
     if err:
         output_error(err)
 
     body = {
+        "reference_image": make_base64_image(args.reference_image),
+        "reference_image_size": {"width": args.ref_width, "height": args.ref_height},
+        "action": args.action,
         "image_size": {"width": args.width, "height": args.height},
-        "from_image": make_base64_image(args.from_image),
     }
 
-    if args.from_view:
-        body["from_view"] = args.from_view
-    if args.to_view:
-        body["to_view"] = args.to_view
-    if args.from_direction:
-        body["from_direction"] = args.from_direction
-    if args.to_direction:
-        body["to_direction"] = args.to_direction
-    if args.view_change is not None:
-        body["view_change"] = args.view_change
-    if args.direction_change is not None:
-        body["direction_change"] = args.direction_change
-    if args.isometric:
-        body["isometric"] = True
-    if args.oblique_projection:
-        body["oblique_projection"] = True
-    if args.image_guidance_scale is not None:
-        body["image_guidance_scale"] = args.image_guidance_scale
-    if args.init_image:
-        body["init_image"] = make_base64_image(args.init_image)
-        body["init_image_strength"] = args.init_image_strength
-    if args.mask_image:
-        body["mask_image"] = make_base64_image(args.mask_image)
-    if args.color_image:
-        body["color_image"] = make_base64_image(args.color_image)
+    if args.no_background is not None:
+        body["no_background"] = args.no_background
     if args.seed is not None:
         body["seed"] = args.seed
 
-    resp, err = api_request("POST", "/rotate", body, api_key)
+    resp, err = api_request("POST", "/animate-with-text-v2", body, api_key)
     if err:
         output_error(err)
 
-    output_path = args.output or "rotated.png"
-    decode_image(resp["image"]["base64"], output_path)
+    images = resp.get("images", [])
+    base = args.output or "frame"
+    output_files = save_image_array(images, base)
     cost = resp.get("usage", {}).get("usd", 0)
-    output_success([output_path], cost)
+
+    if args.spritesheet and len(output_files) > 1:
+        sheet_base = base if not base.endswith(".png") else base[:-4]
+        sheet_path = f"{sheet_base}_spritesheet.png"
+        make_spritesheet(output_files, sheet_path)
+        output_files.append(sheet_path)
+
+    output_success(output_files, cost, {"frame_count": len(images)})
+
+
+def cmd_rotate_8(args):
+    api_key, err = get_api_key()
+    if err:
+        output_error(err)
+
+    body = {
+        "method": args.method,
+        "image_size": {"width": args.width, "height": args.height},
+    }
+
+    if args.method == "rotate_character" and args.reference_image:
+        body["reference_image"] = make_base64_image(args.reference_image)
+    if args.method == "create_with_style" and args.description:
+        body["description"] = args.description
+    if args.method == "create_from_concept" and args.concept_image:
+        body["concept_image"] = make_base64_image(args.concept_image)
+    if args.view:
+        body["view"] = args.view
+
+    resp, err = api_request("POST", "/generate-8-rotations-v2", body, api_key)
+    if err:
+        output_error(err)
+
+    # Response has images dict keyed by direction: S, SW, W, NW, N, NE, E, SE
+    images = resp.get("images", {})
+    base = args.output or "rotation"
+    if base.endswith(".png"):
+        base = base[:-4]
+
+    directions = ["south", "south-west", "west", "north-west",
+                   "north", "north-east", "east", "south-east"]
+    output_files = []
+    for direction in directions:
+        img_data = images.get(direction)
+        if img_data:
+            path = f"{base}_{direction}.png"
+            decode_image(img_data["base64"], path)
+            output_files.append(path)
+
+    cost = resp.get("usage", {}).get("usd", 0)
+    output_success(output_files, cost)
 
 
 def cmd_inpaint(args):
@@ -562,37 +454,159 @@ def cmd_inpaint(args):
 
     body = {
         "description": args.description,
-        "image_size": {"width": args.width, "height": args.height},
         "inpainting_image": make_base64_image(args.inpainting_image),
         "mask_image": make_base64_image(args.mask_image),
     }
 
+    if args.context_image:
+        body["context_image"] = make_base64_image(args.context_image)
     if args.no_background:
         body["no_background"] = True
-    if args.isometric:
-        body["isometric"] = True
-    if args.oblique_projection:
-        body["oblique_projection"] = True
-    if args.text_guidance_scale is not None:
-        body["text_guidance_scale"] = args.text_guidance_scale
-    if args.init_image:
-        body["init_image"] = make_base64_image(args.init_image)
-        body["init_image_strength"] = args.init_image_strength
-    if args.color_image:
-        body["color_image"] = make_base64_image(args.color_image)
 
-    build_body_with_optionals(body, args, [
-        "outline", "shading", "detail", "view", "direction", "seed",
-    ])
-
-    resp, err = api_request("POST", "/inpaint", body, api_key)
+    resp, err = api_request("POST", "/inpaint-v3", body, api_key)
     if err:
         output_error(err)
 
-    output_path = args.output or "inpainted.png"
-    decode_image(resp["image"]["base64"], output_path)
+    images = resp.get("images", [resp.get("image")])
+    if images and images[0] is None:
+        images = []
+    base = args.output or "inpainted"
+    pick = None if args.all else args.pick
+    output_files = save_image_array(images, base, pick)
     cost = resp.get("usage", {}).get("usd", 0)
-    output_success([output_path], cost)
+    output_success(output_files, cost)
+
+
+def cmd_edit(args):
+    api_key, err = get_api_key()
+    if err:
+        output_error(err)
+
+    body = {
+        "method": args.method,
+        "edit_images": [make_base64_image(p) for p in args.edit_images],
+        "image_size": {"width": args.width, "height": args.height},
+    }
+
+    if args.method == "edit_with_text" and args.description:
+        body["description"] = args.description
+    if args.method == "edit_with_reference" and args.reference_image:
+        body["reference_image"] = make_base64_image(args.reference_image)
+    if args.no_background:
+        body["no_background"] = True
+
+    resp, err = api_request("POST", "/edit-images-v2", body, api_key)
+    if err:
+        output_error(err)
+
+    images = resp.get("images", [])
+    base = args.output or "edited"
+    output_files = save_image_array(images, base)
+    cost = resp.get("usage", {}).get("usd", 0)
+    output_success(output_files, cost)
+
+
+def cmd_interpolate(args):
+    api_key, err = get_api_key()
+    if err:
+        output_error(err)
+
+    body = {
+        "start_image": make_base64_image(args.start_image),
+        "end_image": make_base64_image(args.end_image),
+        "action": args.action,
+        "image_size": {"width": args.width, "height": args.height},
+    }
+
+    if args.no_background:
+        body["no_background"] = True
+    if args.seed is not None:
+        body["seed"] = args.seed
+
+    resp, err = api_request("POST", "/interpolation-v2", body, api_key)
+    if err:
+        output_error(err)
+
+    images = resp.get("images", [])
+    base = args.output or "interp"
+    output_files = save_image_array(images, base)
+    cost = resp.get("usage", {}).get("usd", 0)
+
+    if args.spritesheet and len(output_files) > 1:
+        sheet_base = base if not base.endswith(".png") else base[:-4]
+        sheet_path = f"{sheet_base}_spritesheet.png"
+        make_spritesheet(output_files, sheet_path)
+        output_files.append(sheet_path)
+
+    output_success(output_files, cost, {"frame_count": len(images)})
+
+
+def cmd_edit_animation(args):
+    api_key, err = get_api_key()
+    if err:
+        output_error(err)
+
+    body = {
+        "description": args.description,
+        "frames": [make_base64_image(p) for p in args.frames],
+        "image_size": {"width": args.width, "height": args.height},
+    }
+
+    if args.no_background:
+        body["no_background"] = True
+    if args.seed is not None:
+        body["seed"] = args.seed
+
+    resp, err = api_request("POST", "/edit-animation-v2", body, api_key)
+    if err:
+        output_error(err)
+
+    images = resp.get("images", [])
+    base = args.output or "edited_frame"
+    output_files = save_image_array(images, base)
+    cost = resp.get("usage", {}).get("usd", 0)
+
+    if args.spritesheet and len(output_files) > 1:
+        sheet_base = base if not base.endswith(".png") else base[:-4]
+        sheet_path = f"{sheet_base}_spritesheet.png"
+        make_spritesheet(output_files, sheet_path)
+        output_files.append(sheet_path)
+
+    output_success(output_files, cost)
+
+
+def cmd_transfer_outfit(args):
+    api_key, err = get_api_key()
+    if err:
+        output_error(err)
+
+    body = {
+        "reference_image": make_base64_image(args.reference_image),
+        "frames": [make_base64_image(p) for p in args.frames],
+        "image_size": {"width": args.width, "height": args.height},
+    }
+
+    if args.no_background:
+        body["no_background"] = True
+    if args.seed is not None:
+        body["seed"] = args.seed
+
+    resp, err = api_request("POST", "/transfer-outfit-v2", body, api_key)
+    if err:
+        output_error(err)
+
+    images = resp.get("images", [])
+    base = args.output or "outfit_frame"
+    output_files = save_image_array(images, base)
+    cost = resp.get("usage", {}).get("usd", 0)
+
+    if args.spritesheet and len(output_files) > 1:
+        sheet_base = base if not base.endswith(".png") else base[:-4]
+        sheet_path = f"{sheet_base}_spritesheet.png"
+        make_spritesheet(output_files, sheet_path)
+        output_files.append(sheet_path)
+
+    output_success(output_files, cost)
 
 
 def cmd_estimate_skeleton(args):
@@ -629,161 +643,149 @@ def cmd_estimate_skeleton(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="PixelLab API - pixel art generation CLI",
+        description="PixelLab API v2 - pixel art generation CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # balance
-    sub.add_parser("balance", help="Check account credit balance")
+    sub.add_parser("balance", help="Check account balance and subscription")
 
-    # generate-pixflux
-    p = sub.add_parser("generate-pixflux", help="Text-to-pixel-art (up to 400x400)")
+    # generate
+    p = sub.add_parser("generate", help="Generate pixel art from text (Pro)")
     p.add_argument("--description", required=True, help="Text description of image")
     add_size_args(p, 64, 64)
-    add_common_style_args(p)
     p.add_argument("--no-background", action="store_true", help="Transparent background")
-    p.add_argument("--isometric", action="store_true", help="Isometric view")
-    p.add_argument("--text-guidance-scale", type=float, default=None,
-                   help="Text guidance (1.0-20.0, default 8.0)")
-    add_init_image_args(p)
-    p.add_argument("--color-image", default=None, help="Path to color palette image")
-    add_seed_arg(p)
-    p.add_argument("--output", "-o", default=None, help="Output file path (default: output.png)")
-
-    # generate-bitforge
-    p = sub.add_parser("generate-bitforge", help="Style transfer pixel art (up to 200x200)")
-    p.add_argument("--description", required=True, help="Text description of image")
-    add_size_args(p, 64, 64)
-    add_common_style_args(p)
-    p.add_argument("--no-background", action="store_true", help="Transparent background")
-    p.add_argument("--isometric", action="store_true", help="Isometric view")
-    p.add_argument("--oblique-projection", action="store_true", help="Oblique projection view")
-    p.add_argument("--text-guidance-scale", type=float, default=None,
-                   help="Text guidance (1.0-20.0, default 8.0)")
-    p.add_argument("--style-strength", type=float, default=None,
-                   help="Style transfer strength (0-100)")
-    p.add_argument("--coverage-percentage", type=float, default=None,
-                   help="Canvas coverage percentage (0-100)")
-    add_init_image_args(p)
+    p.add_argument("--reference-images", nargs="+", default=None,
+                   help="Paths to up to 4 reference images for guidance")
     p.add_argument("--style-image", default=None, help="Path to style reference image")
-    p.add_argument("--inpainting-image", default=None, help="Path to image to inpaint")
-    p.add_argument("--mask-image", default=None, help="Path to mask image (white=edit area)")
-    p.add_argument("--color-image", default=None, help="Path to color palette image")
-    p.add_argument("--skeleton-keypoints", default=None,
-                   help="Path to JSON file with skeleton keypoints")
     add_seed_arg(p)
-    p.add_argument("--output", "-o", default=None, help="Output file path (default: output.png)")
+    add_pick_arg(p)
+    p.add_argument("--output", "-o", default=None, help="Output path (default: output)")
 
-    # animate-skeleton
-    p = sub.add_parser("animate-skeleton", help="Skeleton-based animation (up to 256x256)")
+    # generate-with-style
+    p = sub.add_parser("generate-with-style", help="Style-guided generation (Pro)")
+    p.add_argument("--description", required=True, help="Text description of image")
+    p.add_argument("--style-images", nargs="+", required=True,
+                   help="Paths to 1-4 style reference images")
+    p.add_argument("--style-description", default=None, help="Description of the style")
     add_size_args(p, 64, 64)
-    p.add_argument("--reference-image", required=True, help="Path to reference character image")
-    p.add_argument("--skeleton-keypoints", required=True,
-                   help="Path to JSON file with skeleton keypoints (array of frames)")
-    p.add_argument("--view", choices=["side", "low top-down", "high top-down"], default=None)
-    p.add_argument("--direction", choices=[
-        "north", "north-east", "east", "south-east",
-        "south", "south-west", "west", "north-west",
-    ], default=None)
-    p.add_argument("--isometric", action="store_true")
-    p.add_argument("--oblique-projection", action="store_true")
-    p.add_argument("--guidance-scale", type=float, default=None,
-                   help="Guidance scale (1.0-20.0, default 4.0)")
-    p.add_argument("--init-images", nargs="+", default=None,
-                   help="Paths to initial frame images")
-    p.add_argument("--init-image-strength", type=int, default=300)
-    p.add_argument("--color-image", default=None, help="Path to color palette image")
+    p.add_argument("--no-background", action="store_true", help="Transparent background")
     add_seed_arg(p)
-    p.add_argument("--spritesheet", action="store_true",
-                   help="Also create a horizontal spritesheet")
-    p.add_argument("--output", "-o", default=None,
-                   help="Output base name (default: frame, produces frame_0.png etc)")
+    add_pick_arg(p)
+    p.add_argument("--output", "-o", default=None, help="Output path (default: output)")
 
-    # animate-text
-    p = sub.add_parser("animate-text", help="Text-guided animation (64x64 only)")
-    p.add_argument("--description", required=True, help="Character description")
+    # animate
+    p = sub.add_parser("animate", help="Text-guided animation (Pro)")
+    p.add_argument("--reference-image", required=True, help="Path to reference character image")
+    p.add_argument("--ref-width", type=int, required=True,
+                   help="Width of reference image in pixels")
+    p.add_argument("--ref-height", type=int, required=True,
+                   help="Height of reference image in pixels")
     p.add_argument("--action", required=True, help="Animation action (e.g. 'walk', 'attack')")
-    p.add_argument("--reference-image", required=True, help="Path to reference character image")
-    p.add_argument("--view", choices=["side", "low top-down", "high top-down"], default=None)
-    p.add_argument("--direction", choices=[
-        "north", "north-east", "east", "south-east",
-        "south", "south-west", "west", "north-west",
-    ], default=None)
-    p.add_argument("--n-frames", type=int, default=None,
-                   help="Total animation frames (2-20, default 4)")
-    p.add_argument("--start-frame-index", type=int, default=None,
-                   help="Starting frame index (0-20, default 0)")
-    p.add_argument("--text-guidance-scale", type=float, default=None,
-                   help="Text guidance (1.0-20.0, default 8.0)")
-    p.add_argument("--image-guidance-scale", type=float, default=None,
-                   help="Image guidance (1.0-20.0, default 1.4)")
-    p.add_argument("--init-images", nargs="+", default=None,
-                   help="Paths to initial frame images")
-    p.add_argument("--init-image-strength", type=int, default=300)
-    p.add_argument("--color-image", default=None, help="Path to color palette image")
+    add_size_args(p, 64, 64)
+    p.add_argument("--no-background", action="store_true", default=None,
+                   help="Transparent background (default: true)")
     add_seed_arg(p)
     p.add_argument("--spritesheet", action="store_true",
                    help="Also create a horizontal spritesheet")
     p.add_argument("--output", "-o", default=None,
-                   help="Output base name (default: frame, produces frame_0.png etc)")
+                   help="Output base name (default: frame)")
 
-    # rotate
-    p = sub.add_parser("rotate", help="Rotate character view/direction (up to 200x200)")
+    # rotate-8
+    p = sub.add_parser("rotate-8", help="Generate 8 directional rotations (Pro)")
+    p.add_argument("--method", required=True,
+                   choices=["rotate_character", "create_with_style", "create_from_concept"],
+                   help="Rotation method")
     add_size_args(p, 64, 64)
-    p.add_argument("--from-image", required=True, help="Path to source image to rotate")
-    p.add_argument("--from-view", choices=["side", "low top-down", "high top-down"],
-                   default=None, help="Current view (default: side)")
-    p.add_argument("--to-view", choices=["side", "low top-down", "high top-down"],
-                   default=None, help="Target view (default: side)")
-    p.add_argument("--from-direction", choices=[
-        "north", "north-east", "east", "south-east",
-        "south", "south-west", "west", "north-west",
-    ], default=None, help="Current direction (default: south)")
-    p.add_argument("--to-direction", choices=[
-        "north", "north-east", "east", "south-east",
-        "south", "south-west", "west", "north-west",
-    ], default=None, help="Target direction (default: east)")
-    p.add_argument("--view-change", type=int, default=None,
-                   help="Degrees to tilt (-90 to 90)")
-    p.add_argument("--direction-change", type=int, default=None,
-                   help="Degrees to rotate (-180 to 180)")
-    p.add_argument("--isometric", action="store_true")
-    p.add_argument("--oblique-projection", action="store_true")
-    p.add_argument("--image-guidance-scale", type=float, default=None,
-                   help="Image guidance (1.0-20.0, default 3.0)")
-    add_init_image_args(p)
-    p.add_argument("--mask-image", default=None, help="Path to mask image (requires init-image)")
-    p.add_argument("--color-image", default=None, help="Path to color palette image")
-    add_seed_arg(p)
+    p.add_argument("--reference-image", default=None,
+                   help="Path to character image (for rotate_character)")
+    p.add_argument("--description", default=None,
+                   help="Text description (for create_with_style)")
+    p.add_argument("--concept-image", default=None,
+                   help="Path to concept image (for create_from_concept)")
+    p.add_argument("--view", choices=["side", "low top-down", "high top-down"],
+                   default=None, help="Camera view angle")
     p.add_argument("--output", "-o", default=None,
-                   help="Output file path (default: rotated.png)")
+                   help="Output base name (default: rotation)")
 
     # inpaint
-    p = sub.add_parser("inpaint", help="Edit masked region of pixel art (up to 200x200)")
-    p.add_argument("--description", required=True, help="Description of what to generate in mask")
-    add_size_args(p, 64, 64)
-    add_common_style_args(p)
+    p = sub.add_parser("inpaint", help="Edit masked region of pixel art (Pro)")
+    p.add_argument("--description", required=True,
+                   help="Description of what to generate in mask")
     p.add_argument("--inpainting-image", required=True, help="Path to image to edit")
     p.add_argument("--mask-image", required=True,
-                   help="Path to mask image (white=edit area, black=keep)")
+                   help="Path to mask (white=regenerate, black=keep)")
+    p.add_argument("--context-image", default=None,
+                   help="Path to style guidance image (up to 1024x1024)")
     p.add_argument("--no-background", action="store_true", help="Transparent background")
-    p.add_argument("--isometric", action="store_true")
-    p.add_argument("--oblique-projection", action="store_true")
-    p.add_argument("--text-guidance-scale", type=float, default=None,
-                   help="Text guidance (1.0-10.0, default 3.0)")
-    add_init_image_args(p)
-    p.add_argument("--color-image", default=None, help="Path to color palette image")
+    add_pick_arg(p)
+    p.add_argument("--output", "-o", default=None, help="Output path (default: inpainted)")
+
+    # edit
+    p = sub.add_parser("edit", help="Edit images with text or reference (Pro)")
+    p.add_argument("--method", required=True,
+                   choices=["edit_with_text", "edit_with_reference"],
+                   help="Edit method")
+    p.add_argument("--edit-images", nargs="+", required=True,
+                   help="Paths to images to edit")
+    add_size_args(p, 64, 64)
+    p.add_argument("--description", default=None,
+                   help="Edit description (for edit_with_text)")
+    p.add_argument("--reference-image", default=None,
+                   help="Path to reference image (for edit_with_reference)")
+    p.add_argument("--no-background", action="store_true", help="Transparent background")
+    p.add_argument("--output", "-o", default=None, help="Output base name (default: edited)")
+
+    # interpolate
+    p = sub.add_parser("interpolate",
+                       help="Generate frames between two keyframes (Pro)")
+    p.add_argument("--start-image", required=True, help="Path to starting keyframe")
+    p.add_argument("--end-image", required=True, help="Path to ending keyframe")
+    p.add_argument("--action", required=True, help="Transition description")
+    add_size_args(p, 64, 64)
+    p.add_argument("--no-background", action="store_true", help="Transparent background")
     add_seed_arg(p)
+    p.add_argument("--spritesheet", action="store_true",
+                   help="Also create a horizontal spritesheet")
     p.add_argument("--output", "-o", default=None,
-                   help="Output file path (default: inpainted.png)")
+                   help="Output base name (default: interp)")
+
+    # edit-animation
+    p = sub.add_parser("edit-animation", help="Edit existing animation frames (Pro)")
+    p.add_argument("--description", required=True, help="Edit description")
+    p.add_argument("--frames", nargs="+", required=True,
+                   help="Paths to 2-16 animation frame images")
+    add_size_args(p, 64, 64)
+    p.add_argument("--no-background", action="store_true", help="Transparent background")
+    add_seed_arg(p)
+    p.add_argument("--spritesheet", action="store_true",
+                   help="Also create a horizontal spritesheet")
+    p.add_argument("--output", "-o", default=None,
+                   help="Output base name (default: edited_frame)")
+
+    # transfer-outfit
+    p = sub.add_parser("transfer-outfit",
+                       help="Transfer outfit across animation frames (Pro)")
+    p.add_argument("--reference-image", required=True,
+                   help="Path to outfit reference image")
+    p.add_argument("--frames", nargs="+", required=True,
+                   help="Paths to 2-16 animation frame images")
+    add_size_args(p, 64, 64)
+    p.add_argument("--no-background", action="store_true", help="Transparent background")
+    add_seed_arg(p)
+    p.add_argument("--spritesheet", action="store_true",
+                   help="Also create a horizontal spritesheet")
+    p.add_argument("--output", "-o", default=None,
+                   help="Output base name (default: outfit_frame)")
 
     # estimate-skeleton
-    p = sub.add_parser("estimate-skeleton", help="Extract skeleton keypoints from character")
+    p = sub.add_parser("estimate-skeleton",
+                       help="Extract skeleton keypoints from character")
     p.add_argument("--image", required=True,
                    help="Path to character image (transparent background)")
     p.add_argument("--output", "-o", default=None,
-                   help="Output JSON file for keypoints (also printed to stdout)")
+                   help="Output JSON file for keypoints")
 
     return parser
 
@@ -794,12 +796,15 @@ def main():
 
     handlers = {
         "balance": cmd_balance,
-        "generate-pixflux": cmd_generate_pixflux,
-        "generate-bitforge": cmd_generate_bitforge,
-        "animate-skeleton": cmd_animate_skeleton,
-        "animate-text": cmd_animate_text,
-        "rotate": cmd_rotate,
+        "generate": cmd_generate,
+        "generate-with-style": cmd_generate_with_style,
+        "animate": cmd_animate,
+        "rotate-8": cmd_rotate_8,
         "inpaint": cmd_inpaint,
+        "edit": cmd_edit,
+        "interpolate": cmd_interpolate,
+        "edit-animation": cmd_edit_animation,
+        "transfer-outfit": cmd_transfer_outfit,
         "estimate-skeleton": cmd_estimate_skeleton,
     }
 
